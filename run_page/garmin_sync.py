@@ -21,6 +21,10 @@ from config import FOLDER_DICT, JSON_FILE, SQL_FILE, config
 from garmin_device_adaptor import wrap_device_info
 from utils import make_activities_file
 
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+import io
+
 # logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
@@ -231,6 +235,7 @@ async def download_garmin_data(client, activity_id, file_type="gpx"):
     folder = FOLDER_DICT.get(file_type, "gpx")
     try:
         file_data = await client.download_activity(activity_id, file_type=file_type)
+        file_data = process_gpx_data_conditionally(file_data)
         file_path = os.path.join(folder, f"{activity_id}.{file_type}")
         need_unzip = False
         if file_type == "fit":
@@ -317,6 +322,148 @@ async def download_new_activities(
     await client.req.aclose()
     return to_generate_garmin_ids, to_generate_garmin_id2title
 
+def process_gpx_data_conditionally(gpx_data_bytes: bytes) -> bytes:
+    """
+    有条件地处理 GPX 数据，仅修改满足条件的 <trkpt> 下 <time> 标签的文本内容，
+    并精确保留原始文件的所有其他结构、命名空间、空白等。
+
+    条件与之前相同：
+    - 元数据年份 < 2020
+    - 元数据时间与第一个轨迹点时间差 >= 2 小时
+
+    参数:
+        gpx_data_bytes: 原始 GPX 文件内容 (bytes)。
+
+    返回:
+        bytes: 修改后的 GPX 文件内容 (bytes)，或在不满足条件或出错时返回原始内容。
+    """
+    # 内部查找时使用的命名空间定义 (仅用于 find/findall)
+    internal_gpx_prefix = 'gpx'
+    gpx_namespace_uri = 'http://www.topografix.com/GPX/1/1'
+    find_namespaces = {internal_gpx_prefix: gpx_namespace_uri}
+
+    metadata_dt = None
+    first_trkpt_dt = None
+    perform_modification = False # 标志是否需要执行修改
+
+    try:
+        # --- 步骤 1: 使用 ElementTree 解析以进行条件检查和定位 ---
+        xml_file = io.BytesIO(gpx_data_bytes)
+        try:
+            tree = ET.parse(xml_file)
+        except ET.ParseError as e:
+             try:
+                gpx_content_str = gpx_data_bytes.decode('utf-8')
+                xml_file = io.StringIO(gpx_content_str)
+                tree = ET.parse(xml_file)
+             except (UnicodeDecodeError, ET.ParseError) as e2:
+                print(f"错误：无法解析 GPX XML: {e2}。将返回原始数据。")
+                return gpx_data_bytes
+        root = tree.getroot()
+
+        # --- 条件检查 ---
+        # 1a. 查找并解析元数据时间
+        metadata_time_el = root.find(f'.//{internal_gpx_prefix}:metadata/{internal_gpx_prefix}:time', find_namespaces)
+        if metadata_time_el is None or metadata_time_el.text is None:
+            print("警告：未找到元数据时间。将返回原始数据。")
+            return gpx_data_bytes
+        try:
+            metadata_dt = datetime.fromisoformat(metadata_time_el.text.replace('Z', '+00:00'))
+        except ValueError as e:
+            print(f"错误：解析元数据时间戳失败: {e}。将返回原始数据。")
+            return gpx_data_bytes
+
+        # 1b. 检查年份条件
+        if metadata_dt.year >= 2020:
+            print(f"信息：元数据年份 ({metadata_dt.year}) >= 2020。不执行处理。")
+            return gpx_data_bytes # 直接返回
+
+        # 1c. 查找并解析第一个轨迹点时间
+        first_trkpt_time_el = root.find(f'.//{internal_gpx_prefix}:trk/{internal_gpx_prefix}:trkseg/{internal_gpx_prefix}:trkpt/{internal_gpx_prefix}:time', find_namespaces)
+        if first_trkpt_time_el is None or first_trkpt_time_el.text is None:
+            print("警告：未找到第一个轨迹点时间。将返回原始数据。")
+            return gpx_data_bytes
+        try:
+            first_trkpt_dt = datetime.fromisoformat(first_trkpt_time_el.text.replace('Z', '+00:00'))
+        except ValueError as e:
+            print(f"错误：解析第一个轨迹点时间戳失败: {e}。将返回原始数据。")
+            return gpx_data_bytes
+
+        # 1d. 检查时间差条件
+        time_difference = abs(metadata_dt - first_trkpt_dt)
+        two_hours = timedelta(hours=2)
+        if time_difference >= two_hours:
+            print(f"信息：元数据年份 < 2020 且时间差 ({time_difference}) >= 2 小时。准备修改时间。")
+            perform_modification = True # 设置标志，表示需要修改
+        else:
+            print(f"信息：时间差 ({time_difference}) < 2 小时。无需修改。")
+            return gpx_data_bytes # 直接返回
+
+    except Exception as e:
+        # 捕获解析和条件检查阶段的任何意外错误
+        print(f"错误：在条件检查阶段发生错误: {e}。将返回原始数据。")
+        return gpx_data_bytes
+
+    # --- 步骤 2: 如果需要修改，收集需要替换的时间字符串 ---
+    if perform_modification:
+        changes_to_make = [] # 存储 (旧字符串, 新字符串) 的列表
+        eight_hours = timedelta(hours=8)
+
+        try:
+            # 再次查找所有轨迹点时间元素 (这次是为了获取文本并计算新值)
+            all_trkpt_time_els = root.findall(f'.//{internal_gpx_prefix}:trk/{internal_gpx_prefix}:trkseg/{internal_gpx_prefix}:trkpt/{internal_gpx_prefix}:time', find_namespaces)
+
+            for time_el in all_trkpt_time_els:
+                if time_el.text:
+                    original_time_str = time_el.text.strip() # 去除可能的空白
+                    try:
+                        current_dt = datetime.fromisoformat(original_time_str.replace('Z', '+00:00'))
+                        adjusted_dt = current_dt - eight_hours
+                        adjusted_time_str = adjusted_dt.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+                        # 只有当新旧字符串不同时才记录更改
+                        if original_time_str != adjusted_time_str:
+                            changes_to_make.append((original_time_str, adjusted_time_str))
+                            # 注意：这里我们记录的是字符串本身，用于后续替换
+
+                    except ValueError:
+                        print(f"警告：在计算新值时跳过无效的时间格式: {original_time_str}")
+                        continue
+
+        except Exception as e:
+            print(f"错误：在收集时间更改信息时发生错误: {e}。将返回原始数据。")
+            return gpx_data_bytes
+
+        # --- 步骤 3: 在原始字节数据上执行字符串替换 ---
+        if not changes_to_make:
+            print("信息：满足修改条件，但没有找到需要更改的时间戳。")
+            return gpx_data_bytes # 没有需要替换的，返回原始数据
+
+        print(f"信息：将执行 {len(changes_to_make)} 次时间戳内容的替换...")
+        modified_gpx_bytes = gpx_data_bytes # 从原始字节开始
+
+        # 使用 set 来处理可能重复的时间戳，确保每种替换只进行一次定义
+        # （bytes.replace 会替换所有匹配项，这正是我们想要的）
+        unique_changes = set(changes_to_make)
+
+        try:
+            for old_str, new_str in unique_changes:
+                old_bytes = old_str.encode('utf-8')
+                new_bytes = new_str.encode('utf-8')
+                # 在整个字节序列中替换所有出现的 old_bytes 为 new_bytes
+                modified_gpx_bytes = modified_gpx_bytes.replace(old_bytes, new_bytes)
+
+            print("信息：时间戳替换完成。")
+            return modified_gpx_bytes
+
+        except Exception as e:
+            print(f"错误：在执行字节替换时发生错误: {e}。将返回原始数据。")
+            return gpx_data_bytes # 如果替换出错，返回原始的更安全
+
+    else:
+        # 如果 perform_modification 为 False (因为条件不满足)
+        # 之前的逻辑已经 return 了，这里理论上不会执行，但作为代码完整性保留
+        return gpx_data_bytes
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
