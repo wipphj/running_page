@@ -30,7 +30,6 @@ def get_all_activity_summaries(session, headers, start_time=None):
     start_time_str = start_time.strftime("%Y-%m-%d %H:%M:%S")
     end_time_str = datetime.now(tz=DEFAULT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     result = []
-    # 接口全量返回，非分页模式
     r = session.get(
         ACTIVITY_LIST_API.format(
             start_time=quote(start_time_str), end_time=quote(end_time_str)
@@ -70,7 +69,6 @@ def get_all_activity_summaries(session, headers, start_time=None):
                         "outdoor": summary["location"] != ",,",
                     }
                 )
-            summary_list_length = len(summary_list)
     return result
 
 
@@ -93,6 +91,7 @@ def merge_summary_and_detail_to_nametuple(summary, detail):
     # end_date = datetime.strftime(summary["end_date"], "%Y-%m-%d %H:%M:%S")
     # end_date_local = datetime.strftime(summary["end_date_local"], "%Y-%m-%d %H:%M:%S")
     average_heartrate = int(detail["avg_hr"])
+    elevation_gain = None
     map = run_map("")
     start_latlng = None
     distance = summary["distance"]
@@ -116,6 +115,9 @@ def merge_summary_and_detail_to_nametuple(summary, detail):
             latlng_list = [[float(point[0]), float(point[1])] for point in point_list]
             map = run_map(polyline.encode(latlng_list))
 
+            altitude_list = [point[2] for point in detail["map_data_list"]]
+            elevation_gain = compute_elevation_gain(altitude_list)
+
     activity_db_instance = {
         "id": id,
         "name": name,
@@ -129,11 +131,21 @@ def merge_summary_and_detail_to_nametuple(summary, detail):
         "moving_time": moving_time,
         "elapsed_time": elapsed_time,
         "average_speed": average_speed,
+        "elevation_gain": elevation_gain,
         "location_country": location_country,
+        "subtype": "Run",
     }
     return namedtuple("activity_db_instance", activity_db_instance.keys())(
         *activity_db_instance.values()
     )
+
+
+def compute_elevation_gain(altitudes):
+    total_gain = 0
+    for i in range(1, len(altitudes)):
+        if float(altitudes[i]) > float(altitudes[i - 1]):
+            total_gain += float(altitudes[i]) - float(altitudes[i - 1])
+    return total_gain
 
 
 def find_last_tulipsport_start_time(track_ids):
@@ -179,6 +191,10 @@ def get_new_activities(token, old_tracks_ids, with_gpx=False):
             if with_gpx and activity_summary["id"] not in old_gpx_ids:
                 save_activity_gpx(activity_summary, activity_detail, track)
         except Exception as e:
+            # print traceback.format_exc()
+            import traceback
+
+            traceback.print_exc()
             print(f"Something wrong parsing tulipsport id {activity_id} " + str(e))
     return tracks
 
@@ -233,8 +249,8 @@ def save_activity_gpx(summary, detail, track):
         file_path = os.path.join(GPX_FOLDER, str(activity_id) + ".gpx")
         with open(file_path, "w") as fb:
             fb.write(gpx.to_xml())
-    except:
-        print(f"saving tulipsort activity {activity_id} gpx occurs errors")
+    except Exception as e:
+        print(f"saving tulipsport activity {activity_id} gpx occurs errors: {str(e)}")
         pass
 
 
