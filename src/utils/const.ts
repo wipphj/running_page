@@ -102,6 +102,8 @@ const LOADING_TEXT = IS_CHINESE ? '加载中...' : 'Loading...';
 const NO_ROUTE_DATA = IS_CHINESE ? '暂无路线数据' : 'No route data';
 const INVALID_ROUTE_DATA = IS_CHINESE ? '路线数据无效' : 'Invalid route data';
 
+const SHOW_ELEVATION_GAIN = true;
+
 const ACTIVITY_TYPES = {
   RUN_GENERIC_TITLE,
   RUN_TRAIL_TITLE,
