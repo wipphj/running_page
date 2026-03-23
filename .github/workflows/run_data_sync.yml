@@ -70,6 +70,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          pip uninstall logfire logfire-api -y || true
 
       - name: Cache Data Files
         if: env.SAVE_DATA_IN_GITHUB_CACHE == 'true'
